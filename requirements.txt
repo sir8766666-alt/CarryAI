@@ -3,5 +3,4 @@ uvicorn[standard]
 httpx
 beautifulsoup4
 google-genai
-python-multipart
 playwright==1.48.0
