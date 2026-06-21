@@ -4,15 +4,15 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 from urllib.parse import urlparse
 
-import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from google import genai
+from playwright.async_api import async_playwright
 
 APP_NAME = "CarryAI"
 
@@ -22,7 +22,6 @@ GEMINI_MODEL_PRIMARY = os.getenv("GEMINI_MODEL_PRIMARY", "gemini-3.1-flash-lite"
 GEMINI_MODEL_FALLBACK = os.getenv("GEMINI_MODEL_FALLBACK", "gemini-2.5-flash").strip()
 USE_GEMINI = os.getenv("USE_GEMINI", "true").lower() == "true"
 
-# Keep this strict so the backend only touches public share links.
 ALLOWED_HOST_SUFFIXES = {
     s.strip().lower()
     for s in os.getenv(
@@ -32,6 +31,26 @@ ALLOWED_HOST_SUFFIXES = {
     ).split(",")
     if s.strip()
 }
+
+SOURCE_NAME_MAP = {
+    "claude.ai": "Claude",
+    "chatgpt.com": "ChatGPT",
+    "gemini.google.com": "Gemini",
+    "g.co": "Gemini",
+    "gemini.ai": "Gemini",
+    "kimi.ai": "Kimi",
+    "chat.kimi.com": "Kimi",
+    "perplexity.ai": "Perplexity",
+    "pplx.ai": "Perplexity",
+}
+
+NOISE_PATTERNS = re.compile(
+    r"^(continue (this )?conversation|sign up|log in|sign in|new chat|"
+    r"share|copy link|regenerate|edit|retry|download|"
+    r"^\d+\s*/\s*\d+$)$",
+    re.IGNORECASE,
+)
+
 OUT_DIR = Path(os.getenv("CARRYAI_OUT_DIR", tempfile.gettempdir())) / "carryai_ctx"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -70,19 +89,6 @@ def normalize_url(url: str) -> str:
     return url
 
 
-from playwright.async_api import async_playwright
-
-SOURCE_NAME_MAP = {
-    "claude.ai": "Claude",
-    "chatgpt.com": "ChatGPT",
-    "gemini.google.com": "Gemini",
-    "g.co": "Gemini",
-    "kimi.ai": "Kimi",
-    "chat.kimi.com": "Kimi",
-    "perplexity.ai": "Perplexity",
-    "pplx.ai": "Perplexity",
-}
-
 def resolve_source_name(host: str) -> str:
     for suffix, name in SOURCE_NAME_MAP.items():
         if host == suffix or host.endswith("." + suffix):
@@ -92,9 +98,9 @@ def resolve_source_name(host: str) -> str:
 
 async def fetch_html(url: str) -> tuple[str, str, str]:
     """
-    Render the share page in headless Chromium so client-side
-    rendered content (Claude/ChatGPT/Gemini/Kimi/Perplexity) is present
-    in the DOM before we extract it.
+    Render the public share page in headless Chromium so client-side
+    rendered content (Claude/ChatGPT/Gemini/Kimi/Perplexity share pages
+    are all JS-rendered SPAs) is present in the DOM before extraction.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -117,13 +123,12 @@ async def fetch_html(url: str) -> tuple[str, str, str]:
 
             final_url = page.url
 
-            # Give SPA hydration a beat, then nudge any virtualized
-            # message lists into rendering by scrolling.
             try:
                 await page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
 
+            # Nudge virtualized/lazy message lists into rendering.
             for _ in range(6):
                 await page.mouse.wheel(0, 2000)
                 await page.wait_for_timeout(350)
@@ -136,12 +141,6 @@ async def fetch_html(url: str) -> tuple[str, str, str]:
         finally:
             await browser.close()
 
-
-NOISE_PATTERNS = re.compile(
-    r"^(continue (this )?conversation|sign up|log in|new chat|"
-    r"share|copy link|regenerate|edit|retry|^\d+ / \d+$)$",
-    re.IGNORECASE,
-)
 
 def extract_visible_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
