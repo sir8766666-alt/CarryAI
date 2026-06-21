@@ -27,11 +27,11 @@ ALLOWED_HOST_SUFFIXES = {
     s.strip().lower()
     for s in os.getenv(
         "ALLOWED_HOST_SUFFIXES",
-        "claude.ai,chatgpt.com,gemini.google.com,gemini.ai,kimi.ai,chat.kimi.com"
+        "claude.ai,chatgpt.com,gemini.google.com,g.co,gemini.ai,"
+        "kimi.ai,chat.kimi.com,perplexity.ai,pplx.ai"
     ).split(",")
     if s.strip()
 }
-
 OUT_DIR = Path(os.getenv("CARRYAI_OUT_DIR", tempfile.gettempdir())) / "carryai_ctx"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -70,48 +70,94 @@ def normalize_url(url: str) -> str:
     return url
 
 
+from playwright.async_api import async_playwright
+
+SOURCE_NAME_MAP = {
+    "claude.ai": "Claude",
+    "chatgpt.com": "ChatGPT",
+    "gemini.google.com": "Gemini",
+    "g.co": "Gemini",
+    "kimi.ai": "Kimi",
+    "chat.kimi.com": "Kimi",
+    "perplexity.ai": "Perplexity",
+    "pplx.ai": "Perplexity",
+}
+
+def resolve_source_name(host: str) -> str:
+    for suffix, name in SOURCE_NAME_MAP.items():
+        if host == suffix or host.endswith("." + suffix):
+            return name
+    return host.split(".")[0].capitalize()
+
+
 async def fetch_html(url: str) -> tuple[str, str, str]:
     """
-    Fetch public share page.
-    Returns: html, final_url, source_name
+    Render the share page in headless Chromium so client-side
+    rendered content (Claude/ChatGPT/Gemini/Kimi/Perplexity) is present
+    in the DOM before we extract it.
     """
-    headers = {
-        "User-Agent": "CarryAI/1.0 (+public-share-context-import)"
-    }
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        try:
+            page = await browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 1600},
+            )
 
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=30.0,
-        headers=headers,
-    ) as client:
-        resp = await client.get(url)
+            response = await page.goto(url, wait_until="networkidle", timeout=30000)
+            if response is None or response.status != 200:
+                status = response.status if response else "no response"
+                raise ValueError(f"Link is not publicly accessible. HTTP {status}")
 
-    if resp.status_code != 200:
-        raise ValueError(f"Link is not publicly accessible. HTTP {resp.status_code}")
+            final_url = page.url
 
-    final_url = str(resp.url)
-    host = urlparse(final_url).hostname or ""
-    source_name = host.split(".")[0].capitalize()
-    return resp.text, final_url, source_name
+            # Give SPA hydration a beat, then nudge any virtualized
+            # message lists into rendering by scrolling.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
 
+            for _ in range(6):
+                await page.mouse.wheel(0, 2000)
+                await page.wait_for_timeout(350)
+
+            html = await page.content()
+
+            host = urlparse(final_url).hostname or ""
+            source_name = resolve_source_name(host.lower())
+            return html, final_url, source_name
+        finally:
+            await browser.close()
+
+
+NOISE_PATTERNS = re.compile(
+    r"^(continue (this )?conversation|sign up|log in|new chat|"
+    r"share|copy link|regenerate|edit|retry|^\d+ / \d+$)$",
+    re.IGNORECASE,
+)
 
 def extract_visible_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    for tag in soup(["script", "style", "noscript"]):
+    for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "button"]):
         tag.decompose()
 
-    main = soup.find("main")
-    if main:
-        text = main.get_text("\n", strip=True)
-    else:
-        text = soup.get_text("\n", strip=True)
+    main = soup.find("main") or soup.find("article") or soup
+    text = main.get_text("\n", strip=True)
 
     lines = []
     for line in text.splitlines():
         line = re.sub(r"\s+", " ", line).strip()
-        if line:
-            lines.append(line)
+        if not line or NOISE_PATTERNS.match(line):
+            continue
+        lines.append(line)
 
     return "\n".join(lines)
 
