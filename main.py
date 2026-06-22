@@ -1,3 +1,4 @@
+
 import asyncio
 import hashlib
 import json
@@ -45,7 +46,7 @@ SOURCE_NAME_MAP = {
     "pplx.ai": "Perplexity",
 }
 
-# These platforms use Next.js SSR — conversation is in __NEXT_DATA__, no JS needed
+# Platforms to try fast-path HTTPX on first
 SSR_PLATFORMS = {"claude.ai", "chatgpt.com"}
 
 NOISE_PATTERNS = re.compile(
@@ -63,6 +64,7 @@ Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
 window.chrome = {runtime: {}};
 """
 
+# Removed Accept-Encoding to let httpx natively handle compression decoding safely.
 HTTPX_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -71,7 +73,6 @@ HTTPX_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "DNT": "1",
 }
 
@@ -140,7 +141,7 @@ def _deep_get(obj, *keys):
 # ─── FETCHERS ───────────────────────────────────────────────────────────────
 
 async def fetch_html_httpx(url: str) -> tuple[str, str, str]:
-    """For Claude + ChatGPT: plain HTTP fetch is enough (SSR pages)."""
+    """Fast-path HTTP GET for pages that server-side render content."""
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=30.0,
@@ -157,13 +158,13 @@ async def fetch_html_httpx(url: str) -> tuple[str, str, str]:
 
 
 async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
-    """For Gemini, Kimi, Perplexity: JS-rendered, need headless browser."""
+    """Robust headless browser for JS-rendered apps and bypassing bot walls."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             args=[
-                "--no-sandbox",               # Required inside Docker
+                "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",    # Prevents OOM crashes in containers
+                "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
             ]
@@ -182,21 +183,26 @@ async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
             await context.add_init_script(STEALTH_SCRIPT)
             page = await context.new_page()
 
-            resp = await page.goto(url, wait_until="networkidle", timeout=45000)
-            if resp is None or resp.status not in (200, 304):
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            
+            # Cloudflare might initially return 403, we let it resolve
+            if resp is None or (resp.status not in (200, 304, 403, 503)):
                 status = resp.status if resp else "no response"
                 raise ValueError(f"Not publicly accessible. HTTP {status}")
 
             final_url = page.url
 
-            # Wait for SPA hydration
+            # Wait logic to bypass Cloudflare / Turnstile
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                await page.wait_for_timeout(3000)
+                title = await page.title()
+                if "Just a moment" in title or "Cloudflare" in title:
+                    await page.wait_for_selector("main, .font-user-message, [data-message-author-role]", timeout=20000)
             except Exception:
                 pass
 
             # Scroll down to trigger lazy/virtualized message rendering
-            for _ in range(10):
+            for _ in range(8):
                 await page.mouse.wheel(0, 2500)
                 await page.wait_for_timeout(350)
 
@@ -204,7 +210,7 @@ async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
             await page.evaluate("window.scrollTo(0, 0)")
             await page.wait_for_timeout(600)
 
-            for _ in range(10):
+            for _ in range(8):
                 await page.mouse.wheel(0, 3000)
                 await page.wait_for_timeout(300)
 
@@ -216,9 +222,27 @@ async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
 
 
 async def fetch_html(url: str) -> tuple[str, str, str]:
+    """Orchestrator: tries HTTPX first, falls back to Playwright if blocked."""
     host = get_host(url)
+    
     if is_ssr_platform(host):
-        return await fetch_html_httpx(url)
+        try:
+            html, final_url, source_name = await fetch_html_httpx(url)
+            
+            # Detect Cloudflare / Security walls or Mojibake
+            is_blocked = "Just a moment..." in html or "cf-browser-verification" in html or "challenges.cloudflare.com" in html
+            is_mojibake = "\x00" in html or len(html) < 250
+            has_content = "__NEXT_DATA__" in html or "font-user-message" in html or "data-message-author-role" in html
+            
+            if is_blocked or is_mojibake or not has_content:
+                print("HTTPX request blocked, incomplete, or corrupted. Falling back to Playwright...")
+                return await fetch_html_playwright(url)
+            
+            return html, final_url, source_name
+        except Exception as e:
+            print(f"HTTPX failed ({e}), falling back to Playwright...")
+            return await fetch_html_playwright(url)
+            
     return await fetch_html_playwright(url)
 
 
@@ -235,61 +259,64 @@ def _parse_next_data(html: str) -> Optional[dict]:
     return None
 
 
-def extract_claude(html: str) -> str:
-    """
-    Claude SSR pages embed full conversation in __NEXT_DATA__.
-    Tries multiple known paths since Anthropic has changed the structure.
-    """
+def extract_claude_dom(soup: BeautifulSoup) -> Optional[str]:
+    """DOM-based extraction for Claude in case __NEXT_DATA__ is absent."""
+    messages = soup.find_all(lambda tag: tag.name == "div" and tag.get("class") and any("font-user-message" in c or "font-claude-message" in c for c in tag.get("class")))
+    if messages:
+        lines = []
+        for msg in messages:
+            role = "USER" if any("font-user-message" in c for c in msg.get("class", [])) else "CLAUDE"
+            lines.append(f"{role}: {msg.get_text(separator=' ', strip=True)}")
+        return "\n\n".join(lines)
+    return None
+
+
+def extract_claude_next(html: str) -> str:
+    """Legacy SSR Extractor."""
     data = _parse_next_data(html)
     if not data:
         return ""
-
     pp = _deep_get(data, "props", "pageProps") or {}
-
-    # Try all known paths for the conversation object
     conversation = (
         pp.get("sharedConversation") or
         pp.get("conversation") or
         _deep_get(pp, "initialData", "conversation") or
         {}
     )
-
     messages = conversation.get("chat_messages") or conversation.get("messages") or []
 
     lines = []
     for msg in messages:
         role = (msg.get("sender") or msg.get("role") or "unknown").upper()
-
-        # Content can be plain string or list of typed blocks
         text = msg.get("text") or ""
         if not text:
             for block in msg.get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
                     text += block.get("text", "")
-
         text = text.strip()
         if text:
             lines.append(f"{role}: {text}")
-
     return "\n\n".join(lines)
 
 
-def extract_chatgpt(html: str) -> str:
-    """
-    ChatGPT share pages are Next.js SSR.
-    Path: props.pageProps.serverResponse.data.linear_conversation
-    Each node: { message: { author: { role }, content: { parts: [str] } } }
-    """
+def extract_chatgpt_dom(soup: BeautifulSoup) -> Optional[str]:
+    """DOM-based extraction for ChatGPT."""
+    messages = soup.select("[data-message-author-role]")
+    if messages:
+        lines = []
+        for msg in messages:
+            role = msg.get("data-message-author-role", "unknown").upper()
+            lines.append(f"{role}: {msg.get_text(separator=' ', strip=True)}")
+        return "\n\n".join(lines)
+    return None
+
+
+def extract_chatgpt_next(html: str) -> str:
+    """Legacy SSR Extractor."""
     data = _parse_next_data(html)
     if not data:
         return ""
-
-    # Primary path
-    linear = _deep_get(
-        data, "props", "pageProps", "serverResponse", "data", "linear_conversation"
-    )
-
-    # Fallback paths
+    linear = _deep_get(data, "props", "pageProps", "serverResponse", "data", "linear_conversation")
     if not linear:
         linear = _deep_get(data, "props", "pageProps", "conversation", "messages")
     if not linear:
@@ -297,38 +324,27 @@ def extract_chatgpt(html: str) -> str:
 
     lines = []
     for node in linear:
-        # Node is either { message: {...} } or the message itself
         msg = node.get("message") if isinstance(node, dict) and "message" in node else node
         if not msg:
             continue
-
         role = _deep_get(msg, "author", "role") or msg.get("role") or "unknown"
         if role in ("system", "tool"):
-            continue  # Skip system/tool messages
-
+            continue
         parts = _deep_get(msg, "content", "parts") or []
         text = " ".join(
-            p if isinstance(p, str)
-            else (p.get("text", "") if isinstance(p, dict) else "")
+            p if isinstance(p, str) else (p.get("text", "") if isinstance(p, dict) else "")
             for p in parts
         ).strip()
-
         if text:
             lines.append(f"{role.upper()}: {text}")
-
     return "\n\n".join(lines)
 
 
 def extract_generic(html: str) -> str:
-    """
-    Generic BeautifulSoup extraction for Gemini, Kimi, Perplexity.
-    By the time this runs, Playwright has fully hydrated the DOM.
-    """
+    """Generic BeautifulSoup extraction for Gemini, Kimi, Perplexity."""
     soup = BeautifulSoup(html, "html.parser")
-
     for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "button", "svg", "img"]):
         tag.decompose()
-
     root = soup.find("main") or soup.find("article") or soup.body or soup
     text = root.get_text("\n", strip=True)
 
@@ -338,23 +354,25 @@ def extract_generic(html: str) -> str:
         if not line or NOISE_PATTERNS.match(line):
             continue
         lines.append(line)
-
     return "\n".join(lines)
 
 
 def extract_visible_text(html: str, source_name: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    
     if source_name == "Claude":
-        result = extract_claude(html)
-        if result:
-            return result
-        # Fall through if __NEXT_DATA__ parse failed
+        text = extract_claude_dom(soup)
+        if text: return text
+        text = extract_claude_next(html)
+        if text: return text
 
     if source_name == "ChatGPT":
-        result = extract_chatgpt(html)
-        if result:
-            return result
+        text = extract_chatgpt_dom(soup)
+        if text: return text
+        text = extract_chatgpt_next(html)
+        if text: return text
 
-    # Gemini, Kimi, Perplexity — or fallback for Claude/ChatGPT
+    # Fallback for Claude/ChatGPT or Default for Gemini/Kimi/Perplexity
     return extract_generic(html)
 
 
@@ -555,3 +573,4 @@ async def download(job_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="File missing.")
     return FileResponse(path=path, filename=file_name, media_type="text/plain")
+
