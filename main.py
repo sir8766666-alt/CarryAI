@@ -46,7 +46,6 @@ SOURCE_NAME_MAP = {
     "pplx.ai": "Perplexity",
 }
 
-# Platforms to try fast-path HTTPX on first
 SSR_PLATFORMS = {"claude.ai", "chatgpt.com"}
 
 NOISE_PATTERNS = re.compile(
@@ -56,15 +55,20 @@ NOISE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Stealth: mask automation flags that trigger bot walls
+# Hardened Stealth Script to bypass Cloudflare Turnstile
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-window.chrome = {runtime: {}};
+window.chrome = { runtime: {} };
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+  parameters.name === 'notifications' ?
+    Promise.resolve({ state: Notification.permission }) :
+    originalQuery(parameters)
+);
 """
 
-# Removed Accept-Encoding to let httpx natively handle compression decoding safely.
 HTTPX_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -96,7 +100,6 @@ jobs: Dict[str, Dict] = {}
 def short_chat_id_from_url(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:20]
 
-
 def normalize_url(url: str) -> str:
     url = url.strip()
     parsed = urlparse(url)
@@ -109,10 +112,8 @@ def normalize_url(url: str) -> str:
         raise ValueError(f"Host '{host}' is not an allowed platform.")
     return url
 
-
 def get_host(url: str) -> str:
     return (urlparse(url).hostname or "").lower()
-
 
 def resolve_source_name(host: str) -> str:
     for suffix, name in SOURCE_NAME_MAP.items():
@@ -120,32 +121,34 @@ def resolve_source_name(host: str) -> str:
             return name
     return host.split(".")[0].capitalize()
 
-
 def is_ssr_platform(host: str) -> bool:
     return any(host == s or host.endswith("." + s) for s in SSR_PLATFORMS)
 
+def is_bot_wall(html: str) -> bool:
+    """Detects if we are stuck on a Cloudflare or standard Bot Wall."""
+    text = html.lower()
+    if "just a moment..." in text and "cloudflare" in text: return True
+    if "cf-browser-verification" in text: return True
+    if "verify you are human" in text and "cloudflare" in text: return True
+    if "enable javascript and cookies to continue" in text: return True
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.find(id="challenge-running"): return True
+    return False
 
 def _deep_get(obj, *keys):
     for key in keys:
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            obj = obj.get(key)
-        elif isinstance(obj, list) and isinstance(key, int):
-            obj = obj[key] if key < len(obj) else None
-        else:
-            return None
+        if obj is None: return None
+        if isinstance(obj, dict): obj = obj.get(key)
+        elif isinstance(obj, list) and isinstance(key, int): obj = obj[key] if key < len(obj) else None
+        else: return None
     return obj
 
 
 # ─── FETCHERS ───────────────────────────────────────────────────────────────
 
 async def fetch_html_httpx(url: str) -> tuple[str, str, str]:
-    """Fast-path HTTP GET for pages that server-side render content."""
     async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=30.0,
-        headers=HTTPX_HEADERS,
+        follow_redirects=True, timeout=30.0, headers=HTTPX_HEADERS
     ) as client:
         resp = await client.get(url)
 
@@ -153,12 +156,10 @@ async def fetch_html_httpx(url: str) -> tuple[str, str, str]:
         raise ValueError(f"Not publicly accessible. HTTP {resp.status_code}")
 
     final_url = str(resp.url)
-    source_name = resolve_source_name(get_host(final_url))
-    return resp.text, final_url, source_name
+    return resp.text, final_url, resolve_source_name(get_host(final_url))
 
 
 async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
-    """Robust headless browser for JS-rendered apps and bypassing bot walls."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             args=[
@@ -171,12 +172,8 @@ async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
         )
         try:
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 1600},
+                user_agent=HTTPX_HEADERS["User-Agent"],
+                viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 timezone_id="America/New_York",
             )
@@ -184,37 +181,30 @@ async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
             page = await context.new_page()
 
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            
-            # Cloudflare might initially return 403, we let it resolve
-            if resp is None or (resp.status not in (200, 304, 403, 503)):
-                status = resp.status if resp else "no response"
-                raise ValueError(f"Not publicly accessible. HTTP {status}")
-
             final_url = page.url
-
-            # Wait logic to bypass Cloudflare / Turnstile
+            
+            # Explicitly wait to see if Cloudflare Turnstile resolves
             try:
-                await page.wait_for_timeout(3000)
-                title = await page.title()
-                if "Just a moment" in title or "Cloudflare" in title:
-                    await page.wait_for_selector("main, .font-user-message, [data-message-author-role]", timeout=20000)
+                # Target CSS classes across Claude, ChatGPT, and general platforms
+                await page.wait_for_selector(
+                    "div[data-is-user], .font-user-message, [data-message-author-role], main", 
+                    timeout=15000
+                )
             except Exception:
+                # Timeout is fine; we will check for bot walls manually below
                 pass
 
-            # Scroll down to trigger lazy/virtualized message rendering
-            for _ in range(8):
-                await page.mouse.wheel(0, 2500)
-                await page.wait_for_timeout(350)
-
-            # Scroll back up so nothing is missed at top
-            await page.evaluate("window.scrollTo(0, 0)")
-            await page.wait_for_timeout(600)
-
-            for _ in range(8):
+            # Scroll to trigger lazy loading
+            for _ in range(5):
                 await page.mouse.wheel(0, 3000)
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(400)
 
             html = await page.content()
+            
+            # Fast fail if still stuck on bot wall
+            if is_bot_wall(html):
+                raise ValueError("Blocked by Cloudflare Turnstile anti-bot protection. Please try again later or check if the IP is blocked.")
+
             source_name = resolve_source_name(get_host(final_url))
             return html, final_url, source_name
         finally:
@@ -222,20 +212,17 @@ async def fetch_html_playwright(url: str) -> tuple[str, str, str]:
 
 
 async def fetch_html(url: str) -> tuple[str, str, str]:
-    """Orchestrator: tries HTTPX first, falls back to Playwright if blocked."""
     host = get_host(url)
     
     if is_ssr_platform(host):
         try:
             html, final_url, source_name = await fetch_html_httpx(url)
             
-            # Detect Cloudflare / Security walls or Mojibake
-            is_blocked = "Just a moment..." in html or "cf-browser-verification" in html or "challenges.cloudflare.com" in html
             is_mojibake = "\x00" in html or len(html) < 250
-            has_content = "__NEXT_DATA__" in html or "font-user-message" in html or "data-message-author-role" in html
+            has_content = "__NEXT_DATA__" in html or "font-user-message" in html or "data-is-user" in html or "data-message-author-role" in html
             
-            if is_blocked or is_mojibake or not has_content:
-                print("HTTPX request blocked, incomplete, or corrupted. Falling back to Playwright...")
+            if is_bot_wall(html) or is_mojibake or not has_content:
+                print("HTTPX request blocked or missing content. Falling back to Playwright...")
                 return await fetch_html_playwright(url)
             
             return html, final_url, source_name
@@ -248,41 +235,43 @@ async def fetch_html(url: str) -> tuple[str, str, str]:
 
 # ─── EXTRACTORS ─────────────────────────────────────────────────────────────
 
-def _parse_next_data(html: str) -> Optional[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    tag = soup.find("script", id="__NEXT_DATA__")
-    if tag and tag.string:
-        try:
-            return json.loads(tag.string)
-        except Exception:
-            return None
-    return None
-
-
 def extract_claude_dom(soup: BeautifulSoup) -> Optional[str]:
-    """DOM-based extraction for Claude in case __NEXT_DATA__ is absent."""
-    messages = soup.find_all(lambda tag: tag.name == "div" and tag.get("class") and any("font-user-message" in c or "font-claude-message" in c for c in tag.get("class")))
+    """Target Claude's modern DOM (Tailwind / React attributes)"""
+    # Claude uses data-is-user, data-test-render-role, or specific font classes
+    messages = soup.find_all(lambda tag: tag.name == "div" and (
+        tag.has_attr('data-is-user') or
+        tag.has_attr('data-test-render-role') or
+        (tag.get('class') and any('font-user-message' in c or 'font-claude-message' in c for c in tag.get('class', [])))
+    ))
+    
     if messages:
         lines = []
         for msg in messages:
-            role = "USER" if any("font-user-message" in c for c in msg.get("class", [])) else "CLAUDE"
-            lines.append(f"{role}: {msg.get_text(separator=' ', strip=True)}")
+            role = "UNKNOWN"
+            if msg.get('data-is-user') == 'true': role = "USER"
+            elif msg.get('data-is-user') == 'false': role = "CLAUDE"
+            elif msg.get('data-test-render-role') == 'user': role = "USER"
+            elif msg.get('data-test-render-role') == 'assistant': role = "CLAUDE"
+            elif any('font-user-message' in c for c in msg.get('class', [])): role = "USER"
+            elif any('font-claude-message' in c for c in msg.get('class', [])): role = "CLAUDE"
+            
+            text = msg.get_text(separator=' ', strip=True)
+            if text:
+                lines.append(f"{role}: {text}")
         return "\n\n".join(lines)
     return None
 
-
 def extract_claude_next(html: str) -> str:
-    """Legacy SSR Extractor."""
-    data = _parse_next_data(html)
-    if not data:
-        return ""
+    """Legacy fallback if Claude rolls back to Next.js"""
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("script", id="__NEXT_DATA__")
+    if not tag or not tag.string: return ""
+    
+    try: data = json.loads(tag.string)
+    except Exception: return ""
+    
     pp = _deep_get(data, "props", "pageProps") or {}
-    conversation = (
-        pp.get("sharedConversation") or
-        pp.get("conversation") or
-        _deep_get(pp, "initialData", "conversation") or
-        {}
-    )
+    conversation = pp.get("sharedConversation") or pp.get("conversation") or _deep_get(pp, "initialData", "conversation") or {}
     messages = conversation.get("chat_messages") or conversation.get("messages") or []
 
     lines = []
@@ -293,14 +282,12 @@ def extract_claude_next(html: str) -> str:
             for block in msg.get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
                     text += block.get("text", "")
-        text = text.strip()
-        if text:
-            lines.append(f"{role}: {text}")
+        if text.strip():
+            lines.append(f"{role}: {text.strip()}")
     return "\n\n".join(lines)
 
 
 def extract_chatgpt_dom(soup: BeautifulSoup) -> Optional[str]:
-    """DOM-based extraction for ChatGPT."""
     messages = soup.select("[data-message-author-role]")
     if messages:
         lines = []
@@ -311,37 +298,7 @@ def extract_chatgpt_dom(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-def extract_chatgpt_next(html: str) -> str:
-    """Legacy SSR Extractor."""
-    data = _parse_next_data(html)
-    if not data:
-        return ""
-    linear = _deep_get(data, "props", "pageProps", "serverResponse", "data", "linear_conversation")
-    if not linear:
-        linear = _deep_get(data, "props", "pageProps", "conversation", "messages")
-    if not linear:
-        return ""
-
-    lines = []
-    for node in linear:
-        msg = node.get("message") if isinstance(node, dict) and "message" in node else node
-        if not msg:
-            continue
-        role = _deep_get(msg, "author", "role") or msg.get("role") or "unknown"
-        if role in ("system", "tool"):
-            continue
-        parts = _deep_get(msg, "content", "parts") or []
-        text = " ".join(
-            p if isinstance(p, str) else (p.get("text", "") if isinstance(p, dict) else "")
-            for p in parts
-        ).strip()
-        if text:
-            lines.append(f"{role.upper()}: {text}")
-    return "\n\n".join(lines)
-
-
 def extract_generic(html: str) -> str:
-    """Generic BeautifulSoup extraction for Gemini, Kimi, Perplexity."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "button", "svg", "img"]):
         tag.decompose()
@@ -351,8 +308,7 @@ def extract_generic(html: str) -> str:
     lines = []
     for line in text.splitlines():
         line = re.sub(r"\s+", " ", line).strip()
-        if not line or NOISE_PATTERNS.match(line):
-            continue
+        if not line or NOISE_PATTERNS.match(line): continue
         lines.append(line)
     return "\n".join(lines)
 
@@ -369,10 +325,7 @@ def extract_visible_text(html: str, source_name: str) -> str:
     if source_name == "ChatGPT":
         text = extract_chatgpt_dom(soup)
         if text: return text
-        text = extract_chatgpt_next(html)
-        if text: return text
 
-    # Fallback for Claude/ChatGPT or Default for Gemini/Kimi/Perplexity
     return extract_generic(html)
 
 
@@ -387,9 +340,8 @@ Rules:
 - Avoid first-person and second-person pronouns.
 - Refer to the person as "the user".
 - Preserve the user's words verbatim where possible: instructions, preferences, corrections, decisions, names, project details, open tasks.
-- Remove greetings, filler, repeated lines, irrelevant small talk.
 - If a detail is uncertain, write "unknown".
-- Keep output compact and highly useful for continuation in another model.
+- VERY IMPORTANT: You MUST copy the transcript EXACTLY underneath the "Transcript:" heading. Do NOT summarize or skip the Transcript section.
 
 Return output in exactly this structure:
 
@@ -456,8 +408,7 @@ def gemini_compress(prompt: str) -> str:
     client = genai.Client(api_key=GEMINI_API_KEY)
     last_error = None
     for model in [GEMINI_MODEL_PRIMARY, GEMINI_MODEL_FALLBACK]:
-        if not model:
-            continue
+        if not model: continue
         try:
             resp = client.models.generate_content(model=model, contents=[prompt])
             text = (getattr(resp, "text", None) or "").strip()
@@ -486,7 +437,7 @@ async def process_job(job_id: str, url: str) -> None:
         if len(transcript) < 100:
             raise ValueError(
                 f"No usable chat content found on this {source_name} link "
-                f"({len(transcript)} chars). Make sure the link is set to public."
+                f"({len(transcript)} chars). Ensure the link is public and accessible."
             )
 
         chat_id = short_chat_id_from_url(final_url)
@@ -573,4 +524,3 @@ async def download(job_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="File missing.")
     return FileResponse(path=path, filename=file_name, media_type="text/plain")
-
