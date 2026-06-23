@@ -323,42 +323,60 @@ async def get_transcript(url: str) -> tuple[str, str, str]:
 
 def build_prompt(source_name: str, source_url: str, chat_id: str, transcript: str) -> str:
     return f"""
-You are helping convert a public AI conversation into a portable context file for another AI assistant.
+You are converting a public AI conversation into a portable context file.
+Another AI model will read this file to instantly continue the work.
 
-Rules:
-- Output plain text only.
-- Avoid first-person and second-person pronouns.
-- Refer to the person as "the user".
-- Preserve the user's words verbatim where possible: instructions, preferences, corrections, decisions, names, project details, open tasks.
-- If a detail is uncertain, write "unknown".
-- VERY IMPORTANT: You MUST copy the transcript EXACTLY underneath the "Transcript:" heading. Do NOT summarize or skip the Transcript section.
+CRITICAL RULES:
+- Capture EVERYTHING useful — from both the user AND the AI model.
+- Preserve ALL code blocks, file contents, and technical implementations verbatim.
+- Preserve ALL requirements, dependencies, configs, and env variables mentioned.
+- Preserve the user's exact words for instructions, decisions, and preferences.
+- Preserve the model's architecture decisions, explanations, and recommendations.
+- Remove only greetings, filler, and small talk. Nothing else.
+- If uncertain about a detail write "unknown".
 
-Return output in exactly this structure:
+Return in EXACTLY this structure:
 
 CTX_VERSION: 1
 SOURCE: {source_name}
 CHAT_ID: {chat_id}
 SOURCE_URL: {source_url}
 
-1. Demographics Information
+1. Demographics & Background
 - ...
 
-2. Interests & Preferences
+2. Project Overview
 - ...
 
-3. Relationships
+3. Tech Stack & Requirements
+- List every library, framework, tool, version, env variable mentioned
 - ...
 
-4. Dated Events, Projects & Plans
+4. Code Files & Implementations
+- Include every code block with its filename if mentioned
+- Format: FILENAME: <name> then full code block
 - ...
 
-5. Instructions
+5. Architecture & Design Decisions
+- Decisions made by both user and model
 - ...
 
-6. Important Verbatim Quotes
+6. User Instructions & Preferences
 - ...
 
-7. Current Open Tasks
+7. Model Recommendations & Insights
+- Important things the AI suggested or warned about
+- ...
+
+8. Bugs & Fixes
+- Every error encountered and how it was resolved
+- ...
+
+9. Open Tasks & Next Steps
+- ...
+
+10. Important Verbatim Quotes
+- From both user and model
 - ...
 
 Imported from: {source_name}
