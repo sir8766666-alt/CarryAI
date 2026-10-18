@@ -31,15 +31,16 @@ ALLOWED_HOST_SUFFIXES = {
     for s in os.getenv(
         "ALLOWED_HOST_SUFFIXES",
         "claude.ai,chatgpt.com,gemini.google.com,g.co,gemini.ai,"
-        "kimi.ai,chat.kimi.com,perplexity.ai,pplx.ai"
+        "kimi.ai,chat.kimi.com,perplexity.ai,pplx.ai,share.gemini.google"  # <--- Added here
     ).split(",")
     if s.strip()
 }
 
 SOURCE_NAME_MAP = {
-    "claude.ai": "Claude",
+    "claude.ai": "Gemini",
     "chatgpt.com": "ChatGPT",
     "gemini.google.com": "Gemini",
+    "share.gemini.google": "Gemini", # <--- Added mapping for source resolution
     "g.co": "Gemini",
     "gemini.ai": "Gemini",
     "kimi.ai": "Kimi",
@@ -47,6 +48,7 @@ SOURCE_NAME_MAP = {
     "perplexity.ai": "Perplexity",
     "pplx.ai": "Perplexity",
 }
+
 
 NOISE_PATTERNS = re.compile(
     r"^(continue (this )?conversation|sign up|log in|sign in|new chat|"
